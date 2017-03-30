@@ -626,6 +626,10 @@ def main():
     parser.add_argument("--ignore-field-prefixes", nargs='*',dest="ignore_field_prefixes", type=str,
         default=['zoneContact','billingContact','technicalContact'], help="list of fields (in whois data) to ignore when extracting and inserting into ElasticSearch")
 
+    parser.add_argument("--redis", action="store", dest="redis",
+        help="If enabled, script will use a redis instance for interprocess communication. Must provide a unix domain socket (e.g. /path/to/socket.sock ) OR network socket ( e.g. 127.0.0.1:6379/database ) ")
+
+
     options = parser.parse_args()
 
     if options.vverbose:
@@ -641,9 +645,37 @@ def main():
 
     threads = []
 
-    work_queue = jmpQueue(maxsize=10000)
-    insert_queue = jmpQueue(maxsize=10000)
-    stats_queue = mpQueue()
+    #setup redis lists or python queues as interprocess communication method
+    if options.redis:
+        redis_info = {}
+        '''TODO: is this hacky if-statement stable?'''
+        if ".sock" in options.redis and ":" not in options.redis:
+            redis_info['redis_con_type']='unix'
+            redis_info['unix_socket_path'] = options.redis
+        elif":" in options.redis:
+            redis_info['redis_con_type'] =='host'
+            redis_info['host'] =  options.redis.split(":")[0],
+            redis_info['port'] =  options.redis.split(":")[1].split("/")[0]
+            redis_info['db'] =  options.redis.split(":")[1].split("/")[1]
+        else:
+            print("Dont recognize argument for redis connection. Please check required format")
+            parser.parse_args(['-h'])
+
+        print(redis_info)
+
+        #create queues that are actually redis lists underneath
+        work_queue = PydatQueue.PydatQueue.factory("redis","work", redis_info)
+        insert_queue = PydatQueue.PydatQueue.factory("redis","insert",redis_info)
+        bulk_request_queue = PydatQueue.PydatQueue.factory("redis","bulk_request",redis_info)
+        stats_queue = PydatQueue.PydatQueue.factory("redis","stats", redis_info)
+
+    #if redis is not specified, default to python multiprocessing queues
+    else:
+        work_queue = PydatQueue.PydatQueue.factory("python-joinable-queue", "work", {'maxsize' : options.bulk_size * options.threads})
+        insert_queue = PydatQueue.PydatQueue.factory("python-joinable-queue","insert", {'maxsize' : options.bulk_size * options.bulk_threads})
+        bulk_request_queue = PydatQueue.PydatQueue.factory("python-joinable-queue", "bulk_request", {'maxsize' : 2 * options.bulk_threads})
+        stats_queue = PydatQueue.PydatQueue.factory("python-queue") 
+
 
     global WHOIS_META, WHOIS_SEARCH
     # Process Index/Alias Format Strings
