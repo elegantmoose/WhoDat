@@ -7,10 +7,9 @@ import hashlib
 import signal
 import time
 import argparse
-import threading
 from threading import Thread, Lock
 import multiprocessing
-from multiprocessing import Process, Queue as mpQueue, JoinableQueue as jmpQueue
+from multiprocessing import Process,Value, Lock, Event
 from pprint import pprint
 import json
 import traceback
@@ -18,10 +17,26 @@ import uuid
 from io import BytesIO
 
 from HTMLParser import HTMLParser
-import Queue as queue
 
 import elasticsearch
 from elasticsearch import helpers
+
+import zmq
+
+#TEST purposes
+import logging
+logging.basicConfig(filename='debug.log',filemode='w', level = logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+def l_sync_data(sync_dict):
+    logger.debug("\n---------------------")
+    for k, v in sync_dict.iteritems():
+        if isinstance(v,_Integer_Counter) :
+            logger.debug("\n %s =  %s", str(k), str(v.value()))
+    logger.debug("\n---------------------")
+
+#END Test
+
 
 STATS = {'total': 0,
          'new': 0,
@@ -37,10 +52,6 @@ FIRST_SEEN = 'dataFirstSeen'
 
 CHANGEDCT = {}
 
-shutdown_event = multiprocessing.Event()
-finished_event = multiprocessing.Event()
-bulkError_event = multiprocessing.Event()
-
 WHOIS_WRITE_FORMAT_STRING = "%s-%d"
 WHOIS_ORIG_WRITE_FORMAT_STRING = "%s-orig-%d"
 WHOIS_DELTA_WRITE_FORMAT_STRING = "%s-delta-%d"
@@ -50,6 +61,26 @@ WHOIS_META_FORMAT_STRING = ".%s-meta"
 
 WHOIS_SEARCH = None
 WHOIS_META = None
+
+ZMQ_SOCKET_DIR = "/tmp/feeds/"
+ZMQ_HWM = 100000     #the high water mark (max queue size) for zeroMQ sockets - set on both sides
+ZMQ_FIN_SIG = 1623
+bulkError_event = Event()
+
+
+#atomic integer counter variable wrapper - used for sync'ing processes
+class _Integer_Counter:
+    def __init__(self, init_val):
+        self.val = Value('i',init_val)
+        self.lock = Lock()
+
+    def value(self):
+        return self.val.value
+
+    def increment(self):
+        with self.lock:
+            self.val.value +=1
+
 
 def connectElastic(uri):
     es = elasticsearch.Elasticsearch(uri,
@@ -62,22 +93,72 @@ def connectElastic(uri):
 
     return es
 
+
+def zmq_sink_vent(zmq_sink_sock, zmq_vent_sock, num_workers, sync_dict):
+
+    #TEST
+    logger.debug("\nSINK_VENT - %s started...  \n", str(os.getpid()))
+    pid = os.getpid()
+
+    context = zmq.Context()
+    #receive socket
+    recvr = context.socket(zmq.PULL)
+    recvr.set_hwm(ZMQ_HWM)
+    recvr.bind(zmq_sink_sock)
+    #send socket
+    sender = context.socket(zmq.PUSH)
+    sender.set_hwm(ZMQ_HWM)
+    sender.bind(zmq_vent_sock)
+
+    while not sync_dict['shutdown_event'].is_set():
+        try:
+            d = recvr.recv_json(zmq.NOBLOCK)
+            sync_dict['sv_sink_ctr'].increment()
+            logger.debug("\nSINK_VENT- %s recvd: \n %s \n", str(pid), str(d))
+            sender.send_json(d)
+            sync_dict['sv_vent_ctr'].increment()
+            logger.debug("\nSINK_VENT- %s sent: \n %s \n", str(pid), str(d))
+        except zmq.error.Again:
+            if sync_dict['worker_done_ctr'].value() == num_workers and sync_dict['sv_sink_ctr'].value() == sync_dict['worker_work_sent_ctr'].value():
+                break
+
+    recvr.unbind(zmq_sink_sock)
+    sender.unbind(zmq_vent_sock)
+
+    sync_dict['sv_done_event'].set()
+
+
 ######## READER THREAD ######
-def reader_worker(work_queue, options):
+def reader_worker(work_vent_sock, options, sync_dict):
+
+    context = zmq.Context()
+    sender = context.socket(zmq.PUSH)
+    sender.set_hwm(ZMQ_HWM)
+    sender.bind(work_vent_sock)
+
+    logger.debug("\nReader worker started - connected to ventilator \n")
+
     if options.directory:
-        scan_directory(work_queue, options.directory, options)
+        scan_directory(sender, options.directory, options, sync_dict)
     elif options.file:
-        parse_csv(work_queue, options.file, options)
+        parse_csv(sender, options.file, options, sync_dict)
     else:
         print("File or Directory required")
 
-def scan_directory(work_queue, directory, options):
+    
+    sync_dict['reader_done_event'].set()
+    sender.unbind(work_vent_sock)
+
+    logger.debug("\nReader shutting down\n")
+
+
+def scan_directory(work_vent, directory, options, sync_dict):
     for root, subdirs, filenames in os.walk(directory):
         if len(subdirs):
             for subdir in sorted(subdirs):
-                scan_directory(work_queue, subdir, options)
+                scan_directory(work_vent, subdir, options, sync_dict)
         for filename in sorted(filenames):
-            if shutdown_event.is_set():
+            if sync_dict['shutdown_event'].is_set():
                 return
             if options.extension != '':
                 fn, ext = os.path.splitext(filename)
@@ -85,7 +166,7 @@ def scan_directory(work_queue, directory, options):
                     continue
 
             full_path = os.path.join(root, filename)
-            parse_csv(work_queue, full_path, options)
+            parse_csv(work_vent, full_path, options, sync_dict)
 
 def check_header(header):
     for field in header:
@@ -95,8 +176,8 @@ def check_header(header):
     return False
 
 
-def parse_csv(work_queue, filename, options):
-    if shutdown_event.is_set():
+def parse_csv(work_vent, filename, options, sync_dict):
+    if sync_dict['shutdown_event'].is_set():
         return
 
     try:
@@ -120,9 +201,10 @@ def parse_csv(work_queue, filename, options):
                 raise unicodecsv.Error('CSV header not found')
 
             for row in dnsreader:
-                if shutdown_event.is_set():
+                if sync_dict['shutdown_event'].is_set():
                     break
-                work_queue.put({'header': header, 'row': row})
+                work_vent.send_json({'header': header, 'row': row})
+                sync_dict['reader_work_sent_ctr'].increment()
         except unicodecsv.Error as e:
             sys.stderr.write("CSV Parse Error in file %s - line %i\n\t%s\n" % (os.path.basename(filename), dnsreader.line_num, str(e)))
     except Exception as e:
@@ -130,33 +212,53 @@ def parse_csv(work_queue, filename, options):
 
 
 ####### STATS THREAD ###########
-def stats_worker(stats_queue):
+def stats_worker(stats_sink_sock):
     global STATS
+    context = zmq.Context()
+    recvr = context.socket(zmq.PULL)
+    recvr.set_hwm(ZMQ_HWM)
+    recvr.bind(stats_sink_sock)
+    logger.debug("Stats worker started - binded to stats sink")
+
     while True:
-        stat = stats_queue.get()
+        stat = recvr.recv_string()
         if stat == 'finished':
             break
         STATS[stat] += 1
+    recvr.unbind(stats_sink_sock)
+    logger.debug("\n Stats worker completed")
 
 ###### ELASTICSEARCH PROCESS ######
 
-def es_bulk_shipper_proc(insert_queue, options):
+def es_bulk_shipper_proc(shipper_recv_sock, options, sync_dict):
+
+    #TEST
+    pid = os.getpid()
+
     os.setpgrp()
 
     global bulkError_event
 
-    def bulkIter():
-        while not (finished_event.is_set() and insert_queue.empty()):
-            try:
-                req = insert_queue.get_nowait()
-                insert_queue.task_done()
-            except queue.Empty:
-                time.sleep(.1)
-                continue
+    context = zmq.Context()
+    recvr = context.socket(zmq.PULL)
+    recvr.set_hwm(ZMQ_HWM)
+    recvr.connect(shipper_recv_sock)
 
-            yield req
+    def bulkIter():
+        while not sync_dict['shutdown_event'].is_set():
+            try:
+                req = recvr.recv_json(zmq.NOBLOCK)
+                sync_dict['shipper_recv_ctr'].increment()
+                logger.debug("\nBulk shipper (%s)- recvd \n %s\n", str(pid), req)
+                yield req
+            except zmq.error.Again:
+                if sync_dict['sv_done_event'].is_set() and sync_dict['shipper_recv_ctr'].value() == sync_dict['sv_vent_ctr'].value():
+                    break
 
     es = connectElastic(options.es_uri)
+
+    logger.debug("\nBulk shipper (%s)  started- connected to ventilator and es instance\n", str(pid))
+
     try:
         for (ok, response) in helpers.parallel_bulk(es, bulkIter(), raise_on_error=False, thread_count=options.bulk_threads, chunk_size=options.bulk_size):
             resp = response[response.keys()[0]]
@@ -169,6 +271,10 @@ def es_bulk_shipper_proc(insert_queue, options):
         if not bulkError_event.is_set():
             bulkError_event.set()
 
+    recvr.unbind(shipper_recv_sock)
+
+    logger.debug("\nBulk Shipper (%s) shutting down\n", str(pid))
+
 ######## WORKER THREADS #########
 
 def update_required(current_entry, options):
@@ -180,73 +286,114 @@ def update_required(current_entry, options):
     else:
         return True
 
-def process_worker(work_queue, insert_queue, stats_queue, options):
-    global shutdown_event
-    global finished_event
+def process_worker(work_recv_sock, work_send_sock, stats_sock, options, sync_dict):
+    #TEST
+    pid = os.getpid()
+
+    #ZMQ sockets
+    context = zmq.Context()
+    #pull from work ventilator socket
+    recvr = context.socket(zmq.PULL)
+    recvr.set_hwm(ZMQ_HWM)
+    recvr.connect(work_recv_sock)
+    #push to work sink socket
+    sender = context.socket(zmq.PUSH)
+    sender.set_hwm(ZMQ_HWM)
+    sender.connect(work_send_sock)
+    #connection to stats sink
+    stats = context.socket(zmq.PUSH)
+    stats.connect(stats_sock)
+
+    logger.debug("\nWorker (%s) started - connected to work vent and work sink, and stats sink\n", str(pid))
+
+
     try:
         os.setpgrp()
         es = connectElastic(options.es_uri)
-        while not shutdown_event.is_set():
+        while not sync_dict['shutdown_event'].is_set():
             try:
-                work = work_queue.get_nowait()
-                try:
-                    entry = parse_entry(work['row'], work['header'], options)
+                work = recvr.recv_json(zmq.NOBLOCK)
+                sync_dict['worker_work_recv_ctr'].increment()
+                #TEST
+                logger.debug("Worker (%s) recv'd : \n%s\n", str(pid),str(work))
+              
+                entry = parse_entry(work['row'], work['header'], options)
 
-                    if entry is None:
-                        print("Malformed Entry")
-                        continue
+                if entry is None:
+                    print("Malformed Entry")
+                    continue
 
-                    domainName = entry['domainName']
+                domainName = entry['domainName']
 
-                    if options.firstImport:
-                        current_entry_raw = None
-                    else:
-                        current_entry_raw = find_entry(es, domainName, options)
+                if options.firstImport:
+                    current_entry_raw = None
+                else:
+                    current_entry_raw = find_entry(es, domainName, options)
 
-                    stats_queue.put('total')
-                    process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, options)
-                finally:
-                    work_queue.task_done()
-            except queue.Empty as e:
-                if finished_event.is_set():
+                stats.send_string('total')
+                process_entry(sender, stats, es, entry, current_entry_raw, options, sync_dict)
+            except zmq.error.Again:
+                if sync_dict['reader_done_event'].is_set() and sync_dict['worker_work_recv_ctr'].value() == sync_dict['reader_work_sent_ctr'].value():
                     break
-                time.sleep(.0001)
-            except Exception as e:
-                sys.stdout.write("Unhandled Exception: %s, %s\n" % (str(e), traceback.format_exc()))
     except Exception as e:
         sys.stdout.write("Unhandled Exception: %s, %s\n" % (str(e), traceback.format_exc()))
 
-def process_reworker(work_queue, insert_queue, stats_queue, options):
-    global shutdown_event
-    global finished_event
+    sync_dict['worker_done_ctr'].increment()
+    recvr.disconnect(work_recv_sock)
+    sender.disconnect(work_send_sock)
+    stats.disconnect(stats_sock)
+
+    logger.debug("\nWorker (%s) shutting down\n", str(pid))
+
+
+def process_reworker(work_recv_sock, work_send_sock, stats_sock, options, sync_dict):
+    #ZMQ sockets
+    context = zmq.Context()
+    #pull from work ventilator socket
+    recvr = context.socket(zmq.PULL)
+    recvr.set_hwm(ZMQ_HWM)
+    recvr.connect(work_recv_sock)
+    #push to work sink socket
+    sender = context.socket(zmq.PUSH)
+    sender.set_hwm(ZMQ_HWM)
+    sender.connect(work_send_sock)
+    #connection to stats sink
+    stats = context.socket(zmq.PUSH)
+    stats.connect(stats_sock)
+
+    logger.debug("\nWorker (%s) started - connected to work vent and work sink, and stats sink\n", str(pid))
+
     try:
         os.setpgrp()
         es = connectElastic(options.es_uri)
-        while not shutdown_event.is_set():
+        while not sync_dict['shutdown_event'].is_set():
             try:
-                work = work_queue.get_nowait()
-                try:
-                    entry = parse_entry(work['row'], work['header'], options)
-                    if entry is None:
-                        print("Malformed Entry")
-                        continue
+                work = recvr.recv_json(zmq.NOBLOCK)
+                sync_dict['worker_work_recv_ctr'].increment()
+    
+                entry = parse_entry(work['row'], work['header'], options)
+                
+                if entry is None:
+                    print("Malformed Entry")
+                    continue
 
-                    domainName = entry['domainName']
-                    current_entry_raw = find_entry(es, domainName, options)
+                domainName = entry['domainName']
+                current_entry_raw = find_entry(es, domainName, options)
 
-                    if update_required(current_entry_raw, options):
-                        stats_queue.put('total')
-                        process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, options)
-                finally:
-                    work_queue.task_done()
-            except queue.Empty as e:
-                if finished_event.is_set():
+                if update_required(current_entry_raw, options):
+                    stats.send_string('total')
+                    process_entry(sender, stats, es, entry, current_entry_raw, options, sync_dict)
+               
+            except zmq.error.Again:
+                if sync_dict['reader_done_event'].is_set() and sync_dict['worker_work_recv_ctr'].value() == sync_dict['reader_work_sent_ctr'].value():
                     break
-                time.sleep(.01)
-            except Exception as e:
-                sys.stdout.write("Unhandled Exception: %s, %s\n" % (str(e), traceback.format_exc()))
     except Exception as e:
         sys.stdout.write("Unhandeled Exception: %s, %s\n" % (str(e), traceback.format_exc()))
+
+    sync_dict['worker_done_ctr'].increment()
+    recvr.disconnect(work_recv_sock)
+    sender.disconnect(work_send_sock)
+    stats.disconnect(stats_sock)
 
 def parse_entry(input_entry, header, options):
     if len(input_entry) == 0:
@@ -322,7 +469,7 @@ def process_command(request, index, _id, _type, entry = None):
     return None #TODO raise instead?
 
 
-def process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, options):
+def process_entry(work_sink, stats_sink, es, entry, current_entry_raw, options, sync_dict):
     domainName = entry['domainName']
     details = entry['details']
     global CHANGEDCT
@@ -337,7 +484,7 @@ def process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, optio
         if not options.update and (current_entry[VERSION_KEY] == options.identifier): # duplicate entry in source csv's?
             if options.vverbose:
                 sys.stdout.write('%s: Duplicate\n' % domainName)
-            stats_queue.put('duplicates')
+            stats_sink.send_string('duplicates')
             return
 
         if options.exclude is not None:
@@ -376,9 +523,9 @@ def process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, optio
             if options.enable_delta_indexes:
                 index_name = WHOIS_ORIG_WRITE_FORMAT_STRING % (options.index_prefix, options.identifier)
             else:
-                index_name = WHOIS_WRITE_FORMAT_STRING % (options.index_prefix, options.indentifier)
+                index_name = WHOIS_WRITE_FORMAT_STRING % (options.index_prefix, options.identifier)
 
-            stats_queue.put('updated')
+            stats_sink.send_string('updated')
             if options.update and ((current_index == index_name) or (options.previousVersion == 0)): #Can't have two documents with the the same id in the same index
                 if options.vverbose:
                     sys.stdout.write("%s: Re-Registered/Transferred\n" % domainName)
@@ -449,7 +596,7 @@ def process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, optio
                                                      entry
                                      ))
         else:
-            stats_queue.put('unchanged')
+            stats_sink.send_string('unchanged')
             if options.vverbose:
                 sys.stdout.write("%s: Unchanged\n" % domainName)
             api_commands.append(process_command(
@@ -464,7 +611,7 @@ def process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, optio
                                                  }
                                  ))
     else:
-        stats_queue.put('new')
+        stats_sink.send_string('new')
         if options.vverbose:
             sys.stdout.write("%s: New\n" % domainName)
         entry_id = generate_id(domainName, options.identifier)
@@ -493,7 +640,9 @@ def process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, optio
                                                 entry
                                 ))
     for command in api_commands:
-        insert_queue.put(command)
+        work_sink.send_json(command)
+        sync_dict['worker_work_sent_ctr'].increment()
+
 
 def generate_id(domainName, identifier):
     dhash = hashlib.md5(domainName.encode('utf-8')).hexdigest() + str(identifier)
@@ -568,8 +717,6 @@ def main():
     global STATS
     global VERSION_KEY
     global CHANGEDCT
-    global shutdown_event
-    global finished_event
     global bulkError_event
 
     parser = argparse.ArgumentParser()
@@ -638,12 +785,7 @@ def main():
         print("A File or Directory source is required")
         parser.parse_args(["-h"])
 
-
     threads = []
-
-    work_queue = jmpQueue(maxsize=10000)
-    insert_queue = jmpQueue(maxsize=10000)
-    stats_queue = mpQueue()
 
     global WHOIS_META, WHOIS_SEARCH
     # Process Index/Alias Format Strings
@@ -840,6 +982,43 @@ def main():
     else:
         options.include = None
 
+    #Set up ZMQ sockets and synchronization variables
+
+    #define zeroMQ IPC sockets that will be used
+    if not os.path.exists(ZMQ_SOCKET_DIR):
+        os.makedirs(ZMQ_SOCKET_DIR)
+    #reader thread will use this socket to push (load balanced) work to worker processes, worker processes will pull from it
+    reader_vent_sock = "ipc://" + ZMQ_SOCKET_DIR+ "read_vent"  
+    #worker processes use this socket as a collection sink to push their completed work; a sink_vent process(sink-1) will pull from this socket
+    sink_sock = "ipc://"+ ZMQ_SOCKET_DIR +"sink"
+    #a sink_vent process will use this socket to push (load balanced) work to shipper processes, shipper processes will pull from it
+    vent_sock = "ipc://"+ ZMQ_SOCKET_DIR + "vent"
+    #a socket to push stats to - used by any process; a stats thread will pull from this socket
+    stats_sink_sock = "ipc://"+ ZMQ_SOCKET_DIR + "stats"
+
+    #synchronization variables (bc zeroMQ unexplainably sucks at an type of interprocess communication management)
+    sync_dict = {}
+    sync_dict['reader_work_sent_ctr'] = _Integer_Counter(0)
+    sync_dict['reader_done_event'] = Event()
+    sync_dict['worker_work_recv_ctr'] = _Integer_Counter(0)
+    sync_dict['worker_work_sent_ctr'] = _Integer_Counter(0)
+    sync_dict['worker_done_ctr'] = _Integer_Counter(0)
+    sync_dict['sv_sink_ctr'] = _Integer_Counter(0)
+    sync_dict['sv_vent_ctr'] = _Integer_Counter(0)
+    sync_dict['sv_done_event'] = Event()
+    sync_dict['shipper_recv_ctr'] = _Integer_Counter(0)
+    sync_dict['shutdown_event'] = Event()
+
+    #start sink_vent process
+    sink_vent = Process(target=zmq_sink_vent, args=(sink_sock, vent_sock, options.threads, sync_dict))
+    sink_vent.start()
+
+    context = zmq.Context()
+    stats_sink = context.socket(zmq.PUSH)
+    stats_sink.connect(stats_sink_sock)
+
+    time.sleep(2)
+
     # Redo or Update Mode
     if options.redo or options.update:
         # Get the record for the attempted import
@@ -884,7 +1063,7 @@ def main():
         for ch in CHANGEDCT.keys():
             CHANGEDCT[ch] = int(CHANGEDCT[ch])
 
-        #Start the reworker threads
+        #Start the worker or reworker threads
         if options.verbose:
             print("Starting %i %s threads" % (options.threads, "reworker" if options.redo else "update"))
 
@@ -895,10 +1074,11 @@ def main():
 
         for i in range(options.threads):
             t = Process(target=target,
-                        args=(work_queue,
-                              insert_queue,
-                              stats_queue,
-                              options),
+                        args=(reader_vent_sock,
+                              sink_sock,
+                              stats_sink_sock,
+                              options,
+                              sync_dict),
                         name='Worker %i' % i)
             t.daemon = True
             t.start()
@@ -913,10 +1093,11 @@ def main():
 
         for i in range(options.threads):
             t = Process(target=process_worker,
-                        args=(work_queue, 
-                              insert_queue, 
-                              stats_queue,
-                              options), 
+                        args=(reader_vent_sock, 
+                              sink_sock, 
+                              stats_sink_sock,
+                              options,
+                              sync_dict), 
                         name='Worker %i' % i)
             t.daemon = True
             t.start()
@@ -945,16 +1126,19 @@ def main():
             
         es.create(index=WHOIS_META, id=options.identifier, doc_type='meta',  body = meta_struct)
 
-
-    es_bulk_shipper = Thread(target=es_bulk_shipper_proc, args=(insert_queue, options))
+    es_bulk_shipper = Thread(target=es_bulk_shipper_proc, args=(vent_sock, options, sync_dict))
     es_bulk_shipper.start()
 
-    stats_worker_thread = Thread(target=stats_worker, args=(stats_queue,), name = 'Stats')
+    time.sleep(1)
+
+    stats_worker_thread = Thread(target=stats_worker, args=(stats_sink_sock,), name = 'Stats')
     stats_worker_thread.daemon = True
     stats_worker_thread.start()
 
+    time.sleep(2)
+
     #Start up Reader Thread
-    reader_thread = Thread(target=reader_worker, args=(work_queue, options), name='Reader')
+    reader_thread = Thread(target=reader_worker, args=(reader_vent_sock, options, sync_dict), name='Reader')
     reader_thread.daemon = True
     reader_thread.start()
 
@@ -972,22 +1156,21 @@ def main():
             sys.stdout.write("All files ingested ... please wait for processing to complete ... \n")
             sys.stdout.flush()
 
-        while not work_queue.empty():
-            # If bulkError occurs stop processing
-            if bulkError_event.is_set():
-                sys.stdout.write("Bulk API error -- forcing program shutdown \n")
-                raise KeyboardInterrupt("Error response from ES worker, stopping processing")
-
-        work_queue.join()
-
+    
         try:
             # Since this is the shutdown section, ignore Keyboard Interrupts
             # especially since the interrupt code (below) does effectively the same thing
-            insert_queue.join()
-            finished_event.set()
-            es_bulk_shipper.join()
+            
+            #processes shut themselves down in the same order as the work pipeline
+            #workers finish
             for t in threads:
                 t.join()
+
+            #sink/vent process finishes
+            sink_vent.join()
+
+            #shipper finishes
+            es_bulk_shipper.join()
 
             # Change settings back
             if options.optimize_import:
@@ -1001,7 +1184,7 @@ def main():
 
                 unOptimizeIndex(es, index, data_template)
 
-            stats_queue.put('finished')
+            stats_sink.send_string('finished')
             stats_worker_thread.join()
 
             #Update the stats
@@ -1038,34 +1221,21 @@ def main():
 
     except KeyboardInterrupt as e:
         sys.stdout.write("\rCleaning Up ... Please Wait ...\nWarning!! Forcefully killing this might leave Elasticsearch in an inconsistent state!\n")
-        shutdown_event.set()
+        sync_dict['shutdown_event'].set()
 
-        # Flush the queue if the reader is alive so it can see the shutdown_event
-        # in case it's blocked on a put
-        sys.stdout.write("\tShutting down input reader threads ...\n")
-        while reader_thread.is_alive():
-            try:
-                work_queue.get_nowait()
-                work_queue.task_done()
-            except queue.Empty:
-                break
-
+        sys.stdout.write("\tShutting down reader thread ...\n")
+        
         reader_thread.join()
-
-        # Don't join on the work queue, we don't care if the work has been finished
-        # The worker threads will exit on their own after getting the shutdown_event
-
-        # Joining on the insert queue is important to ensure ES isn't left in an inconsistent state if delta indexes are being used
-        # since it 'moves' documents from one index to another which involves an insert and a delete
-        insert_queue.join()
 
         # All of the workers should have seen the shutdown event and exited after finishing whatever they were last working on
         sys.stdout.write("\tStopping workers ... \n")
         for t in threads:
             t.join()
 
+        sink_vent.join()
+
         # Send the finished message to the stats queue to shut it down
-        stats_queue.put('finished')
+        stats_sink.send_string('finished')
         stats_worker_thread.join()
 
         sys.stdout.write("\tWaiting for ElasticSearch bulk uploads to finish ... \n")
