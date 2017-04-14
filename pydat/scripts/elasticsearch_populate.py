@@ -63,19 +63,19 @@ def connectElastic(uri):
     return es
 
 ######## READER THREAD ######
-def reader_worker(work_queue, options):
+def reader_worker(read_queue, options):
     if options.directory:
-        scan_directory(work_queue, options.directory, options)
+        scan_directory(read_queue, options.directory, options)
     elif options.file:
-        parse_csv(work_queue, options.file, options)
+        parse_csv(read_queue, options.file, options)
     else:
         print("File or Directory required")
 
-def scan_directory(work_queue, directory, options):
+def scan_directory(read_queue, directory, options):
     for root, subdirs, filenames in os.walk(directory):
         if len(subdirs):
             for subdir in sorted(subdirs):
-                scan_directory(work_queue, subdir, options)
+                scan_directory(read_queue, subdir, options)
         for filename in sorted(filenames):
             if shutdown_event.is_set():
                 return
@@ -85,7 +85,7 @@ def scan_directory(work_queue, directory, options):
                     continue
 
             full_path = os.path.join(root, filename)
-            parse_csv(work_queue, full_path, options)
+            parse_csv(read_queue, full_path, options)
 
 def check_header(header):
     for field in header:
@@ -95,7 +95,7 @@ def check_header(header):
     return False
 
 
-def parse_csv(work_queue, filename, options):
+def parse_csv(read_queue, filename, options):
     if shutdown_event.is_set():
         return
 
@@ -122,7 +122,7 @@ def parse_csv(work_queue, filename, options):
             for row in dnsreader:
                 if shutdown_event.is_set():
                     break
-                work_queue.put({'header': header, 'row': row})
+                read_queue.put({'header': header, 'row': row})
         except unicodecsv.Error as e:
             sys.stderr.write("CSV Parse Error in file %s - line %i\n\t%s\n" % (os.path.basename(filename), dnsreader.line_num, str(e)))
     except Exception as e:
@@ -138,7 +138,58 @@ def stats_worker(stats_queue):
             break
         STATS[stat] += 1
 
-###### ELASTICSEARCH PROCESS ######
+###### ELASTICSEARCH GET PROCESS #########
+def es_bulk_get_proc(read_queue, work_queue, stats_queue, options):
+
+    try:
+        es = connectElastic(options.es_uri)
+        docs = []
+        mget_ctr = 0
+
+        while 1:
+            work = read_queue.get_nowait()
+            try:
+                entry = parse_entry(work['row'], work['header'], options)
+                
+                if entry is None:
+                    print("Malformed Entry")
+                    continue
+
+                domainName = entry['domainName']
+                
+                '''
+                    can already push work unit as dont need to wait
+                    for bulk get, as no existing data yet in ES
+                '''
+                if options.firstImport:
+                    current_entry_raw = None
+                    work_queue.put({"entry": entry, "current_entry_raw": current_entry_raw})
+                
+                else:
+                    (domain_name_only, tld) = parse_domain(domainName)
+                    
+                    for index_name in options.INDEX_LIST:
+                        doc = {'_index': index_name, '_type': tld, '_id': domain_name_only}
+                        docs.append(doc)
+                
+                    mget_ctr +=1
+
+                    if mget_ctr >= options.bulk_get_threads:
+                        result = es.mget(body = {"docs": docs})
+                        for res in result['docs']:
+                            if res['found']:
+                                work_queue.put({"entry": entry, "current_entry_raw": res})
+
+                        docs = []
+                        mget_ctr = 0
+
+            except Exception as e:
+                sys.stdout.write("Unhandled Exception: %s, %s\n" % (str(e), traceback.format_exc()))
+    except Exception as e:
+        sys.stdout.write("Unhandled Exception: %s, %s\n" % (str(e), traceback.format_exc()))
+
+
+###### ELASTICSEARCH SHIPPER PROCESS ######
 
 def es_bulk_shipper_proc(insert_queue, options):
     os.setpgrp()
@@ -189,32 +240,20 @@ def process_worker(work_queue, insert_queue, stats_queue, options):
         while not shutdown_event.is_set():
             try:
                 work = work_queue.get_nowait()
-                try:
-                    entry = parse_entry(work['row'], work['header'], options)
+                entry = work['entry']
+                current_entry_raw = work['current_raw_entry']
 
-                    if entry is None:
-                        print("Malformed Entry")
-                        continue
-
-                    domainName = entry['domainName']
-
-                    if options.firstImport:
-                        current_entry_raw = None
-                    else:
-                        current_entry_raw = find_entry(es, domainName, options)
-
-                    stats_queue.put('total')
-                    process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, options)
-                finally:
-                    work_queue.task_done()
+                stats_queue.put('total')
+                process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, options)
+            finally:
+                work_queue.task_done()
             except queue.Empty as e:
                 if finished_event.is_set():
                     break
                 time.sleep(.0001)
-            except Exception as e:
-                sys.stdout.write("Unhandled Exception: %s, %s\n" % (str(e), traceback.format_exc()))
     except Exception as e:
         sys.stdout.write("Unhandled Exception: %s, %s\n" % (str(e), traceback.format_exc()))
+
 
 def process_reworker(work_queue, insert_queue, stats_queue, options):
     global shutdown_event
@@ -222,31 +261,26 @@ def process_reworker(work_queue, insert_queue, stats_queue, options):
     try:
         os.setpgrp()
         es = connectElastic(options.es_uri)
+
         while not shutdown_event.is_set():
             try:
                 work = work_queue.get_nowait()
-                try:
-                    entry = parse_entry(work['row'], work['header'], options)
-                    if entry is None:
-                        print("Malformed Entry")
-                        continue
+                entry = work['entry']
+                current_entry_raw = work['current_raw_entry']
 
-                    domainName = entry['domainName']
-                    current_entry_raw = find_entry(es, domainName, options)
+                if update_required(current_entry_raw, options):
+                    stats_queue.put('total')
 
-                    if update_required(current_entry_raw, options):
-                        stats_queue.put('total')
-                        process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, options)
-                finally:
-                    work_queue.task_done()
+                process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, options)
+            finally:
+                work_queue.task_done()
             except queue.Empty as e:
                 if finished_event.is_set():
                     break
                 time.sleep(.01)
-            except Exception as e:
-                sys.stdout.write("Unhandled Exception: %s, %s\n" % (str(e), traceback.format_exc()))
     except Exception as e:
         sys.stdout.write("Unhandeled Exception: %s, %s\n" % (str(e), traceback.format_exc()))
+
 
 def parse_entry(input_entry, header, options):
     if len(input_entry) == 0:
@@ -640,7 +674,7 @@ def main():
 
 
     threads = []
-
+    read_queue = jmpQueue(maxsize=10000)
     work_queue = jmpQueue(maxsize=10000)
     insert_queue = jmpQueue(maxsize=10000)
     stats_queue = mpQueue()
@@ -956,8 +990,13 @@ def main():
     #perf testing
     st = time.time()
 
+    #start up ES bulk get process
+    es_bulk_getter = Process(target=es_bulk_get_proc, args=(read_queue, work_queue, stats_queue, options))
+    es_bulk_getter.daemon = True
+    es_bulk_getter.start()
+    
     #Start up Reader Thread
-    reader_thread = Thread(target=reader_worker, args=(work_queue, options), name='Reader')
+    reader_thread = Thread(target=reader_worker, args=(read_queue, options), name='Reader')
     reader_thread.daemon = True
     reader_thread.start()
 
@@ -988,6 +1027,7 @@ def main():
             # especially since the interrupt code (below) does effectively the same thing
             insert_queue.join()
             finished_event.set()
+            es_bulk_getter.join()
             es_bulk_shipper.join()
             for t in threads:
                 t.join()
@@ -1075,6 +1115,7 @@ def main():
 
         sys.stdout.write("\tWaiting for ElasticSearch bulk uploads to finish ... \n")
         finished_event.set()
+        es_bulk_getter.join()
         es_bulk_shipper.join()
 
         #Attempt to update the stats
