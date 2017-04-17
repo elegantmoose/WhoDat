@@ -51,6 +51,11 @@ WHOIS_META_FORMAT_STRING = ".%s-meta"
 WHOIS_SEARCH = None
 WHOIS_META = None
 
+#testing log file
+import logging
+logging.basicConfig(filename='debug.log',filemode='w', level = logging.DEBUG)
+logger = logging.getLogger(__name__)
+
 def connectElastic(uri):
     es = elasticsearch.Elasticsearch(uri,
                                      sniff_on_start=True,
@@ -140,53 +145,73 @@ def stats_worker(stats_queue):
 
 ###### ELASTICSEARCH GET PROCESS #########
 def es_bulk_get_proc(read_queue, work_queue, stats_queue, options):
-
+    global shutdown_event
+    global finished_event
     try:
         es = connectElastic(options.es_uri)
         docs = []
+        new_entries = {}
         mget_ctr = 0
 
-        while 1:
-            work = read_queue.get_nowait()
+        while not shutdown_event.is_set():
             try:
-                entry = parse_entry(work['row'], work['header'], options)
-                
-                if entry is None:
-                    print("Malformed Entry")
-                    continue
-
-                domainName = entry['domainName']
-                
-                '''
-                    can already push work unit as dont need to wait
-                    for bulk get, as no existing data yet in ES
-                '''
-                if options.firstImport:
-                    current_entry_raw = None
-                    work_queue.put({"entry": entry, "current_entry_raw": current_entry_raw})
-                
-                else:
-                    (domain_name_only, tld) = parse_domain(domainName)
+                work = read_queue.get_nowait()
+                try:
+                    entry = parse_entry(work['row'], work['header'], options)
                     
-                    for index_name in options.INDEX_LIST:
-                        doc = {'_index': index_name, '_type': tld, '_id': domain_name_only}
-                        docs.append(doc)
-                
-                    mget_ctr +=1
+                    if entry is None:
+                        print("Malformed Entry")
+                        continue
 
-                    if mget_ctr >= options.bulk_get_threads:
-                        result = es.mget(body = {"docs": docs})
-                        for res in result['docs']:
-                            if res['found']:
-                                work_queue.put({"entry": entry, "current_entry_raw": res})
+                    domainName = entry['domainName']
+                    logger.debug("\n GETTER: obtained from read queue: %s \n", str(domainName))
+                    '''
+                        can already push work unit as dont need to wait
+                        for bulk get, as no existing data yet in ES
+                    '''
+                    if options.firstImport:
+                        current_entry_raw = None
+                        work_queue.put({"entry": entry, "current_entry_raw": current_entry_raw})
+                        logger.debug("\n GETTER: put {entry, current_entry_raw} to work queue: %s \n", str(domainName))
 
-                        docs = []
-                        mget_ctr = 0
+                    
+                    else:
+                        (domain_name_only, tld) = parse_domain(domainName)
+                        
+                        for index_name in options.INDEX_LIST:
+                            doc = {'_index': index_name, '_type': tld, '_id': domain_name_only}
+                            docs.append(doc)
+                            #record new entry, to pair with raw entry when sending to queue
+                            entries[domain_name_only] = entry
+                    
+                        mget_ctr +=1
 
+                        if mget_ctr >= options.bulk_get_size:
+                            result = es.mget(body = {"docs": docs})
+                            for res in result['docs']:
+                                if res['found']:
+                                    work_queue.put({"entry": entries[res['_id']], "current_entry_raw": res})
+                                    logger.debug("\n GETTER(in mget): put {entry, current_entry_raw} to work queue: %s \n", str(res['_id']))
+
+                            docs = []
+                            mget_ctr = 0
+                finally:
+                    read_queue.task_done()
+            except queue.Empty as e:
+                if finished_event.is_set():
+                    break
+                time.sleep(.0001)
             except Exception as e:
                 sys.stdout.write("Unhandled Exception: %s, %s\n" % (str(e), traceback.format_exc()))
     except Exception as e:
         sys.stdout.write("Unhandled Exception: %s, %s\n" % (str(e), traceback.format_exc()))
+
+    #complete remaining domains to be retrieved
+    if mget_ctr >= 0:
+        result = es.mget(body = {"docs": docs})
+        for res in result['docs']:
+            if res['found']:
+                work_queue.put({"entry": entry, "current_entry_raw": res})
 
 
 ###### ELASTICSEARCH SHIPPER PROCESS ######
@@ -209,7 +234,7 @@ def es_bulk_shipper_proc(insert_queue, options):
 
     es = connectElastic(options.es_uri)
     try:
-        for (ok, response) in helpers.parallel_bulk(es, bulkIter(), raise_on_error=False, thread_count=options.bulk_threads, chunk_size=options.bulk_size):
+        for (ok, response) in helpers.parallel_bulk(es, bulkIter(), raise_on_error=False, thread_count=options.bulk_shipper_threads, chunk_size=options.bulk_ship_size):
             resp = response[response.keys()[0]]
             if not ok and resp['status'] not in [404, 409]:
                     if not bulkError_event.is_set():
@@ -240,13 +265,14 @@ def process_worker(work_queue, insert_queue, stats_queue, options):
         while not shutdown_event.is_set():
             try:
                 work = work_queue.get_nowait()
-                entry = work['entry']
-                current_entry_raw = work['current_raw_entry']
+                try:
+                    entry = work['entry']
+                    current_entry_raw = work['current_raw_entry']
 
-                stats_queue.put('total')
-                process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, options)
-            finally:
-                work_queue.task_done()
+                    stats_queue.put('total')
+                    process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, options)
+                finally:
+                    work_queue.task_done()
             except queue.Empty as e:
                 if finished_event.is_set():
                     break
@@ -261,19 +287,19 @@ def process_reworker(work_queue, insert_queue, stats_queue, options):
     try:
         os.setpgrp()
         es = connectElastic(options.es_uri)
-
         while not shutdown_event.is_set():
             try:
                 work = work_queue.get_nowait()
-                entry = work['entry']
-                current_entry_raw = work['current_raw_entry']
+                try:
+                    entry = work['entry']
+                    current_entry_raw = work['current_raw_entry']
 
-                if update_required(current_entry_raw, options):
-                    stats_queue.put('total')
+                    if update_required(current_entry_raw, options):
+                        stats_queue.put('total')
 
-                process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, options)
-            finally:
-                work_queue.task_done()
+                    process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, options)
+                finally:
+                    work_queue.task_done()
             except queue.Empty as e:
                 if finished_event.is_set():
                     break
@@ -646,15 +672,19 @@ def main():
         default=['localhost:9200'], help="Location(s) of ElasticSearch Server (e.g., foo.server.com:9200) Can take multiple endpoints")
     parser.add_argument("-p", "--index-prefix", action="store", dest="index_prefix",
         default='whois', help="Index prefix to use in ElasticSearch (default: whois)")
-    parser.add_argument("-B", "--bulk-size", action="store", dest="bulk_size", type=int,
-        default=1000, help="Size of Bulk Elasticsearch Requests")
+    parser.add_argument("--bulk-get-size", action="store", dest="bulk_get_size", type=int, 
+        default=100, help="Size of Bulk Elasticsearch Requests taht oocur within bulk get process(es)")
+    parser.add_argument("-B", "--bulk-ship-size", action="store", dest="bulk_ship_size", type=int,
+        default=1000, help="Size of Bulk Elasticsearch Requests that occur within bulk shipper process(es)")
     parser.add_argument("--optimize-import", action="store_true", dest="optimize_import",
         default=False, help="If enabled, will change ES index settings to speed up bulk imports, but if the cluster has a failure, data might be lost permanently!")
 
     parser.add_argument("-t", "--threads", action="store", dest="threads", type=int,
         default=2, help="Number of workers, defaults to 2. Note that each worker will increase the load on your ES cluster since it will try to lookup whatever record it is working on in ES")
-    parser.add_argument("--bulk-threads", action="store", dest="bulk_threads", type=int,
-        default=1, help="How many threads to spawn to send bulk ES messages. The larger your cluster, the more you can increase this")
+    parser.add_argument("--bulk-get-threads", action="store", dest="bulk_get_threads", type=int,
+        default=1, help="How many bulk get threads to spawn to send mget bulk ES messages. These threads are used for retrieving existing domain records from ES")
+    parser.add_argument("--bulk-shipper-threads", action="store", dest="bulk_shipper_threads", type=int,
+        default=1, help="How many bulk shipper threads to spawn to send index/update bulk ES messages. The larger your cluster, the more you can increase this")
     parser.add_argument("--enable-delta-indexes", action="store_true", dest="enable_delta_indexes",
         default=False, help="If enabled, will put changed entries in a separate index. These indexes can be safely deleted if space is an issue, also provides some other improvements")
     parser.add_argument("--ignore-field-prefixes", nargs='*',dest="ignore_field_prefixes", type=str,
