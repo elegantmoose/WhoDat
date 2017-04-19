@@ -56,6 +56,14 @@ import logging
 logging.basicConfig(filename='debug.log',filemode='w', level = logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+#testing print dicts
+def debug_print_dict(dict_):
+    logger.debug("\n------------------------------")
+    for k,v in dict_.iteritems():
+        logger.debug("\n %s : %s", str(k), str(v))
+    logger.debug("\n------------------------------\n")
+
+
 def connectElastic(uri):
     es = elasticsearch.Elasticsearch(uri,
                                      sniff_on_start=True,
@@ -164,7 +172,6 @@ def es_bulk_get_proc(read_queue, work_queue, stats_queue, options):
                         continue
 
                     domainName = entry['domainName']
-                    logger.debug("\n GETTER: obtained from read queue: %s \n", str(domainName))
                     '''
                         can already push work unit as dont need to wait
                         for bulk get, as no existing data yet in ES
@@ -172,7 +179,9 @@ def es_bulk_get_proc(read_queue, work_queue, stats_queue, options):
                     if options.firstImport:
                         current_entry_raw = None
                         work_queue.put({"entry": entry, "current_entry_raw": current_entry_raw})
-                        logger.debug("\n GETTER: put {entry, current_entry_raw} to work queue: %s \n", str(domainName))
+                        #testing
+                        #logger.debug("\n GETTER: put to work queue: \n")
+                        #debug_print_dict(entry)
 
                     
                     else:
@@ -182,7 +191,7 @@ def es_bulk_get_proc(read_queue, work_queue, stats_queue, options):
                             doc = {'_index': index_name, '_type': tld, '_id': domain_name_only}
                             docs.append(doc)
                             #record new entry, to pair with raw entry when sending to queue
-                            entries[domain_name_only] = entry
+                            new_entries[domain_name_only] = entry
                     
                         mget_ctr +=1
 
@@ -190,9 +199,8 @@ def es_bulk_get_proc(read_queue, work_queue, stats_queue, options):
                             result = es.mget(body = {"docs": docs})
                             for res in result['docs']:
                                 if res['found']:
-                                    work_queue.put({"entry": entries[res['_id']], "current_entry_raw": res})
-                                    logger.debug("\n GETTER(in mget): put {entry, current_entry_raw} to work queue: %s \n", str(res['_id']))
-
+                                    work_queue.put({"entry": new_entries[res['_id']], "current_entry_raw": res})
+                                    logger.debug("\n GETTER(in mget): put to work queue: \n entry: %s \n current_entry_raw: %s", new_entries[res['id']], res)
                             docs = []
                             mget_ctr = 0
                 finally:
@@ -207,11 +215,11 @@ def es_bulk_get_proc(read_queue, work_queue, stats_queue, options):
         sys.stdout.write("Unhandled Exception: %s, %s\n" % (str(e), traceback.format_exc()))
 
     #complete remaining domains to be retrieved
-    if mget_ctr >= 0:
+    if mget_ctr > 0:
         result = es.mget(body = {"docs": docs})
         for res in result['docs']:
             if res['found']:
-                work_queue.put({"entry": entry, "current_entry_raw": res})
+                work_queue.put({"entry": new_entries[res['_id']], "current_entry_raw": res})
 
 
 ###### ELASTICSEARCH SHIPPER PROCESS ######
@@ -259,15 +267,17 @@ def update_required(current_entry, options):
 def process_worker(work_queue, insert_queue, stats_queue, options):
     global shutdown_event
     global finished_event
+    logger.debug("\nWorker on...\n")
     try:
         os.setpgrp()
         es = connectElastic(options.es_uri)
         while not shutdown_event.is_set():
             try:
                 work = work_queue.get_nowait()
+                logger.debug("\nWorker obtained: \n Entry: %s \n\n Raw Entry: %s\n", work['entry'], work['current_entry_raw'])
                 try:
                     entry = work['entry']
-                    current_entry_raw = work['current_raw_entry']
+                    current_entry_raw = work['current_entry_raw']
 
                     stats_queue.put('total')
                     process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, options)
