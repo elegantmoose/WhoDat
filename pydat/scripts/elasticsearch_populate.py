@@ -200,7 +200,7 @@ def es_bulk_get_proc(read_queue, work_queue, stats_queue, options):
                             for res in result['docs']:
                                 if res['found']:
                                     work_queue.put({"entry": new_entries[res['_id']], "current_entry_raw": res})
-                                    logger.debug("\n GETTER(in mget): put to work queue: \n entry: %s \n current_entry_raw: %s", new_entries[res['id']], res)
+                                    logger.debug("\n GETTER(in mget): put to work queue: \n entry: %s \n current_entry_raw: %s\n", new_entries[res['_id']], res)
                             docs = []
                             mget_ctr = 0
                 finally:
