@@ -183,25 +183,25 @@ def es_bulk_get_proc(read_queue, work_queue, stats_queue, options):
                         #logger.debug("\n GETTER: put to work queue: \n")
                         #debug_print_dict(entry)
 
-                    
                     else:
                         (domain_name_only, tld) = parse_domain(domainName)
-                        
+                        #form ES get messages for the specified domain
                         for index_name in options.INDEX_LIST:
                             doc = {'_index': index_name, '_type': tld, '_id': domain_name_only}
                             docs.append(doc)
-                            #record new entry, to pair with raw entry when sending to queue
-                            new_entries[domain_name_only] = entry
+
+                        #record new entry, to pair with current entry when sending to queue
+                        new_entries[domain_name_only] = entry
                     
                         mget_ctr +=1
 
                         if mget_ctr >= options.bulk_get_size:
                             result = es.mget(body = {"docs": docs})
-                            for res in result['docs']:
-                                if res['found']:
-                                    work_queue.put({"entry": new_entries[res['_id']], "current_entry_raw": res})
-                                    logger.debug("\n GETTER(in mget): put to work queue: \n entry: %s \n current_entry_raw: %s\n", new_entries[res['_id']], res)
-                            docs = []
+                            _process_mget_resp(work_queue, new_entries, result, len(options.INDEX_LIST))
+                            
+                            #clean up for next set
+                            del docs[:]
+                            new_entries.clear()
                             mget_ctr = 0
                 finally:
                     read_queue.task_done()
@@ -216,10 +216,44 @@ def es_bulk_get_proc(read_queue, work_queue, stats_queue, options):
 
     #complete remaining domains to be retrieved
     if mget_ctr > 0:
-        result = es.mget(body = {"docs": docs})
-        for res in result['docs']:
-            if res['found']:
-                work_queue.put({"entry": new_entries[res['_id']], "current_entry_raw": res})
+        results = es.mget(body = {"docs": docs})
+        _process_mget_resp(work_queue, new_entries, result, len(options.INDEX_LIST))
+                
+    
+'''
+internal utility function
+'''
+def _process_mget_resp(work_queue, new_entries, mget_results , num_indices):
+    domain_set= []
+    for res in mget_results['docs']:
+        #keep grabbing all ES responses(should be one for every index in ES) for particular domain
+        if len(domain_set) < num_indices:
+            domain_set.append(res)
+
+        #if have all ES responses from every index for a single domain entry
+        if len(domain_set) == num_indices:
+            for r in domain_set:
+                if r['found']:
+                    #since ES responses are returned in order from most recent index, grab first one
+                    work_queue.put({"entry": new_entries[r['_id']], "current_entry_raw": r})
+
+                    #testing
+                    #logger.debug("\n GETTER put to work queue - unit %s\n", str(work_ctr))
+                    logger.debug("\n GETTER: put to work queue: \n entry: %s \n current_entry_raw: %s\n", new_entries[r['_id']], r)
+                    break
+
+                else:
+                    continue
+
+                #if not found, put "None"
+                work_queue.put({"entry": new_entries[r['_id']], "current_entry_raw": None})
+
+                #testing
+                #logger.debug("\n GETTER  put to work queue - unit %s\n", str(work_ctr))
+                logger.debug("\n GETTER: put to work queue: \n entry: %s \n current_entry_raw: %s\n", new_entries[r['_id']], str(None))
+
+            del domain_set[:]
+
 
 
 ###### ELASTICSEARCH SHIPPER PROCESS ######
@@ -230,9 +264,15 @@ def es_bulk_shipper_proc(insert_queue, options):
     global bulkError_event
 
     def bulkIter():
+        #testing
+        work_ctr =0
         while not (finished_event.is_set() and insert_queue.empty()):
             try:
                 req = insert_queue.get_nowait()
+                #testing
+                work_ctr +=1
+                logger.debug("\n BulkIter: produced unit %s\n", str(work_ctr))
+
                 insert_queue.task_done()
             except queue.Empty:
                 time.sleep(.1)
@@ -267,14 +307,20 @@ def update_required(current_entry, options):
 def process_worker(work_queue, insert_queue, stats_queue, options):
     global shutdown_event
     global finished_event
+
+    #testing
     logger.debug("\nWorker on...\n")
+    work_ctr = 0
     try:
         os.setpgrp()
         es = connectElastic(options.es_uri)
         while not shutdown_event.is_set():
             try:
                 work = work_queue.get_nowait()
-                logger.debug("\nWorker obtained: \n Entry: %s \n\n Raw Entry: %s\n", work['entry'], work['current_entry_raw'])
+                work_ctr +=1
+                #testing
+                #logger.debug("\nWorker obtained: unit %s \n", str(work_ctr))
+                #logger.debug("\nWorker obtained: \n Entry: %s \n\n Raw Entry: %s\n", work['entry'], work['current_entry_raw'])
                 try:
                     entry = work['entry']
                     current_entry_raw = work['current_entry_raw']
@@ -289,6 +335,9 @@ def process_worker(work_queue, insert_queue, stats_queue, options):
                 time.sleep(.0001)
     except Exception as e:
         sys.stdout.write("Unhandled Exception: %s, %s\n" % (str(e), traceback.format_exc()))
+        logger.debug("\nWorker shutting down with error: %s...\n" % str(e))
+
+    logger.debug("\nWorker shutting down...\n")
 
 
 def process_reworker(work_queue, insert_queue, stats_queue, options):
@@ -446,7 +495,7 @@ def process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, optio
             if options.enable_delta_indexes:
                 index_name = WHOIS_ORIG_WRITE_FORMAT_STRING % (options.index_prefix, options.identifier)
             else:
-                index_name = WHOIS_WRITE_FORMAT_STRING % (options.index_prefix, options.indentifier)
+                index_name = WHOIS_WRITE_FORMAT_STRING % (options.index_prefix, options.identifier)
 
             stats_queue.put('updated')
             if options.update and ((current_index == index_name) or (options.previousVersion == 0)): #Can't have two documents with the the same id in the same index
@@ -562,8 +611,11 @@ def process_entry(insert_queue, stats_queue, es, entry, current_entry_raw, optio
                                                 tld,
                                                 entry
                                 ))
+    #testing
     for command in api_commands:
         insert_queue.put(command)
+        #testing
+        logger.debug("\nWorker enqueued es-command %s\n", json.dumps(command))
 
 def generate_id(domainName, identifier):
     dhash = hashlib.md5(domainName.encode('utf-8')).hexdigest() + str(identifier)
@@ -1054,23 +1106,30 @@ def main():
             sys.stdout.write("All files ingested ... please wait for processing to complete ... \n")
             sys.stdout.flush()
 
-        while not work_queue.empty():
+        while not read_queue.empty():
             # If bulkError occurs stop processing
             if bulkError_event.is_set():
                 sys.stdout.write("Bulk API error -- forcing program shutdown \n")
                 raise KeyboardInterrupt("Error response from ES worker, stopping processing")
 
-        work_queue.join()
 
         try:
             # Since this is the shutdown section, ignore Keyboard Interrupts
             # especially since the interrupt code (below) does effectively the same thing
+            read_queue.join()
+            logger.debug("\n Read Queue joined\n")
+            work_queue.join()
+            logger.debug("\n Work Queue joined \n")
             insert_queue.join()
+            logger.debug("\n Insert Queue joined\n")
+
             finished_event.set()
-            es_bulk_getter.join()
+            
             es_bulk_shipper.join()
             for t in threads:
                 t.join()
+
+            es_bulk_getter.join()
 
             # Change settings back
             if options.optimize_import:
