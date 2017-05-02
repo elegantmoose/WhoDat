@@ -9,8 +9,7 @@ import time
 import argparse
 import threading
 from threading import Thread, Lock
-import multiprocessing
-from multiprocessing import Process, Queue as mpQueue, JoinableQueue as jmpQueue
+from multiprocessing import Process, Queue as mpQueue, JoinableQueue as jmpQueue , Value, Event
 from pprint import pprint
 import json
 import traceback
@@ -36,10 +35,6 @@ UNIQUE_KEY = 'dataUniqueID'
 FIRST_SEEN = 'dataFirstSeen'
 
 CHANGEDCT = {}
-
-shutdown_event = multiprocessing.Event()
-finished_event = multiprocessing.Event()
-bulkError_event = multiprocessing.Event()
 
 WHOIS_WRITE_FORMAT_STRING = "%s-%d"
 WHOIS_ORIG_WRITE_FORMAT_STRING = "%s-orig-%d"
@@ -76,15 +71,15 @@ def connectElastic(uri):
     return es
 
 ######## READER THREAD ######
-def reader_worker(read_queue, options):
+def reader_worker(read_queue, options, shutdown_event):
     if options.directory:
-        scan_directory(read_queue, options.directory, options)
+        scan_directory(read_queue, options.directory, options, shutdown_event)
     elif options.file:
-        parse_csv(read_queue, options.file, options)
+        parse_csv(read_queue, options.file, options, shutdown_event)
     else:
         print("File or Directory required")
 
-def scan_directory(read_queue, directory, options):
+def scan_directory(read_queue, directory, options, shutdown_event):
     for root, subdirs, filenames in os.walk(directory):
         if len(subdirs):
             for subdir in sorted(subdirs):
@@ -108,7 +103,7 @@ def check_header(header):
     return False
 
 
-def parse_csv(read_queue, filename, options):
+def parse_csv(read_queue, filename, options, shutdown_event):
     if shutdown_event.is_set():
         return
 
@@ -152,14 +147,14 @@ def stats_worker(stats_queue):
         STATS[stat] += 1
 
 ###### ELASTICSEARCH GET PROCESS #########
-def es_bulk_get_proc(read_queue, work_queue, stats_queue, options):
-    global shutdown_event
-    global finished_event
+def es_bulk_get_proc(read_queue, work_queue, stats_queue, options, read_fin_event, shutdown_event):
     try:
         es = connectElastic(options.es_uri)
         docs = []
         new_entries = {}
         mget_ctr = 0
+
+        logger.debug("\n Bulk Getter up...\n")
 
         while not shutdown_event.is_set():
             try:
@@ -196,8 +191,8 @@ def es_bulk_get_proc(read_queue, work_queue, stats_queue, options):
                         mget_ctr +=1
 
                         if mget_ctr >= options.bulk_get_size:
-                            result = es.mget(body = {"docs": docs})
-                            _process_mget_resp(work_queue, new_entries, result, len(options.INDEX_LIST))
+                            results = es.mget(body = {"docs": docs})
+                            _process_mget_resp(work_queue, new_entries, results, len(options.INDEX_LIST))
                             
                             #clean up for next set
                             del docs[:]
@@ -206,7 +201,7 @@ def es_bulk_get_proc(read_queue, work_queue, stats_queue, options):
                 finally:
                     read_queue.task_done()
             except queue.Empty as e:
-                if finished_event.is_set():
+                if read_fin_event.is_set():
                     break
                 time.sleep(.0001)
             except Exception as e:
@@ -217,7 +212,10 @@ def es_bulk_get_proc(read_queue, work_queue, stats_queue, options):
     #complete remaining domains to be retrieved
     if mget_ctr > 0:
         results = es.mget(body = {"docs": docs})
-        _process_mget_resp(work_queue, new_entries, result, len(options.INDEX_LIST))
+        _process_mget_resp(work_queue, new_entries, results, len(options.INDEX_LIST))
+
+    #testing
+    logger.debug("\n Bulk Getter shutting down...\n")
                 
     
 '''
@@ -258,20 +256,18 @@ def _process_mget_resp(work_queue, new_entries, mget_results , num_indices):
 
 ###### ELASTICSEARCH SHIPPER PROCESS ######
 
-def es_bulk_shipper_proc(insert_queue, options):
+def es_bulk_shipper_proc(insert_queue, options, worker_fin_event, bulkError_event):
     os.setpgrp()
-
-    global bulkError_event
 
     def bulkIter():
         #testing
-        work_ctr =0
-        while not (finished_event.is_set() and insert_queue.empty()):
+        #work_ctr =0
+        while not (worker_fin_event.is_set() and insert_queue.empty()):
             try:
                 req = insert_queue.get_nowait()
                 #testing
-                work_ctr +=1
-                logger.debug("\n BulkIter: produced unit %s\n", str(work_ctr))
+                #work_ctr +=1
+                #logger.debug("\n BulkIter: produced unit %s\n", str(work_ctr))
 
                 insert_queue.task_done()
             except queue.Empty:
@@ -304,10 +300,7 @@ def update_required(current_entry, options):
     else:
         return True
 
-def process_worker(work_queue, insert_queue, stats_queue, options):
-    global shutdown_event
-    global finished_event
-
+def process_worker(work_queue, insert_queue, stats_queue, options, bulk_getter_fin_event, shutdown_event):
     #testing
     logger.debug("\nWorker on...\n")
     work_ctr = 0
@@ -330,19 +323,18 @@ def process_worker(work_queue, insert_queue, stats_queue, options):
                 finally:
                     work_queue.task_done()
             except queue.Empty as e:
-                if finished_event.is_set():
+                if bulk_getter_fin_event.is_set():
                     break
                 time.sleep(.0001)
     except Exception as e:
         sys.stdout.write("Unhandled Exception: %s, %s\n" % (str(e), traceback.format_exc()))
         logger.debug("\nWorker shutting down with error: %s...\n" % str(e))
 
-    logger.debug("\nWorker shutting down...\n")
+    #testing
+    #logger.debug("\nWorker shutting down...\n")
 
 
-def process_reworker(work_queue, insert_queue, stats_queue, options):
-    global shutdown_event
-    global finished_event
+def process_reworker(work_queue, insert_queue, stats_queue, options, bulk_getter_fin_event, shutdown_event):
     try:
         os.setpgrp()
         es = connectElastic(options.es_uri)
@@ -360,7 +352,7 @@ def process_reworker(work_queue, insert_queue, stats_queue, options):
                 finally:
                     work_queue.task_done()
             except queue.Empty as e:
-                if finished_event.is_set():
+                if bulk_getter_fin_event.is_set():
                     break
                 time.sleep(.01)
     except Exception as e:
@@ -690,9 +682,15 @@ def main():
     global STATS
     global VERSION_KEY
     global CHANGEDCT
-    global shutdown_event
-    global finished_event
-    global bulkError_event
+
+    shutdown_event = Event()
+    bulkError_event = Event()
+
+    read_fin_event = Event()
+    bulk_getter_fin_event = Event()
+    worker_fin_event = Event()
+
+
 
     parser = argparse.ArgumentParser()
 
@@ -1024,7 +1022,9 @@ def main():
                         args=(work_queue,
                               insert_queue,
                               stats_queue,
-                              options),
+                              options,
+                              bulk_getter_fin_event, 
+                              shutdown_event),
                         name='Worker %i' % i)
             t.daemon = True
             t.start()
@@ -1042,7 +1042,9 @@ def main():
                         args=(work_queue, 
                               insert_queue, 
                               stats_queue,
-                              options), 
+                              options,
+                              bulk_getter_fin_event,
+                              shutdown_event), 
                         name='Worker %i' % i)
             t.daemon = True
             t.start()
@@ -1072,7 +1074,7 @@ def main():
         es.create(index=WHOIS_META, id=options.identifier, doc_type='meta',  body = meta_struct)
 
 
-    es_bulk_shipper = Thread(target=es_bulk_shipper_proc, args=(insert_queue, options))
+    es_bulk_shipper = Thread(target=es_bulk_shipper_proc, args=(insert_queue, options, worker_fin_event, bulkError_event))
     es_bulk_shipper.start()
 
     stats_worker_thread = Thread(target=stats_worker, args=(stats_queue,), name = 'Stats')
@@ -1083,12 +1085,12 @@ def main():
     st = time.time()
 
     #start up ES bulk get process
-    es_bulk_getter = Process(target=es_bulk_get_proc, args=(read_queue, work_queue, stats_queue, options))
+    es_bulk_getter = Process(target=es_bulk_get_proc, args=(read_queue, work_queue, stats_queue, options, read_fin_event, shutdown_event))
     es_bulk_getter.daemon = True
     es_bulk_getter.start()
     
     #Start up Reader Thread
-    reader_thread = Thread(target=reader_worker, args=(read_queue, options), name='Reader')
+    reader_thread = Thread(target=reader_worker, args=(read_queue, options, shutdown_event), name='Reader')
     reader_thread.daemon = True
     reader_thread.start()
 
@@ -1112,24 +1114,42 @@ def main():
                 sys.stdout.write("Bulk API error -- forcing program shutdown \n")
                 raise KeyboardInterrupt("Error response from ES worker, stopping processing")
 
+        read_queue.join()
+        #test
+        logger.debug("\nReader Thread joined...\n")
 
         try:
             # Since this is the shutdown section, ignore Keyboard Interrupts
             # especially since the interrupt code (below) does effectively the same thing
-            read_queue.join()
-            logger.debug("\n Read Queue joined\n")
-            work_queue.join()
-            logger.debug("\n Work Queue joined \n")
-            insert_queue.join()
-            logger.debug("\n Insert Queue joined\n")
 
-            finished_event.set()
-            
-            es_bulk_shipper.join()
-            for t in threads:
-                t.join()
+            #The shutdown sequence may seem to be overkill but for small data script runs
+            #the later queues in the script may shutdown before the work gets to them
+            read_fin_event.set()
+
+            logger.debug("\nread_fin_event set...\n")
 
             es_bulk_getter.join()
+
+            logger.debug("\nBulk getter joined...\n")
+            
+            bulk_getter_fin_event.set()
+
+            logger.debug("\n bulk_getter_fin_event set")
+           
+            work_queue.join()
+            logger.debug("\n Work Queue joined \n")
+            
+            for t in threads:
+                t.join()
+            logger.debug("\n Workers joined \n")
+            
+            worker_fin_event.set()
+            
+            insert_queue.join()
+            logger.debug("\n Insert Queue joined\n")
+            
+            es_bulk_shipper.join()
+
 
             # Change settings back
             if options.optimize_import:
@@ -1213,7 +1233,7 @@ def main():
         stats_worker_thread.join()
 
         sys.stdout.write("\tWaiting for ElasticSearch bulk uploads to finish ... \n")
-        finished_event.set()
+
         es_bulk_getter.join()
         es_bulk_shipper.join()
 
