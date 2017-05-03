@@ -174,9 +174,6 @@ def es_bulk_get_proc(read_queue, work_queue, stats_queue, options, read_fin_even
                     if options.firstImport:
                         current_entry_raw = None
                         work_queue.put({"entry": entry, "current_entry_raw": current_entry_raw})
-                        #testing
-                        #logger.debug("\n GETTER: put to work queue: \n")
-                        #debug_print_dict(entry)
 
                     else:
                         (domain_name_only, tld) = parse_domain(domainName)
@@ -230,25 +227,26 @@ def _process_mget_resp(work_queue, new_entries, mget_results , num_indices):
 
         #if have all ES responses from every index for a single domain entry
         if len(domain_set) == num_indices:
+            found = None
             for r in domain_set:
                 if r['found']:
                     #since ES responses are returned in order from most recent index, grab first one
-                    work_queue.put({"entry": new_entries[r['_id']], "current_entry_raw": r})
-
-                    #testing
-                    #logger.debug("\n GETTER put to work queue - unit %s\n", str(work_ctr))
-                    logger.debug("\n GETTER: put to work queue: \n entry: %s \n current_entry_raw: %s\n", new_entries[r['_id']], r)
+                    found = {"entry": new_entries[r['_id']], "current_entry_raw": r}
                     break
-
                 else:
                     continue
 
-                #if not found, put "None"
+            #enqueue work(new and current domain records)
+            if found:
+                work_queue.put(found)
+                #testing
+                #logger.debug("\n GETTER put to work queue - unit %s\n", str(work_ctr))
+                logger.debug("\n GETTER: put to work queue: \n entry: %s \n current_entry_raw: %s\n", new_entries[r['_id']], r)
+            else:
                 work_queue.put({"entry": new_entries[r['_id']], "current_entry_raw": None})
-
                 #testing
                 #logger.debug("\n GETTER  put to work queue - unit %s\n", str(work_ctr))
-                logger.debug("\n GETTER: put to work queue: \n entry: %s \n current_entry_raw: %s\n", new_entries[r['_id']], str(None))
+                logger.debug("\n GETTER: put to work queue(no previous record in ES): \n entry: %s \n current_entry_raw: %s\n", new_entries[r['_id']], str(None))
 
             del domain_set[:]
 
